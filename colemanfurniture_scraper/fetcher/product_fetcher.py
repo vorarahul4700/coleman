@@ -1008,45 +1008,83 @@ class ProductFetcher(Spider):
     def handle_product_error(self, failure):
         self.failed_count += 1
         
-        # Try to extract the URL from the failure
+        # Initialize variables
         failed_url = "Unknown URL"
+        status_code = "N/A"
+        error_type = "Unknown"
+        error_msg = "Unknown"
         
-        # Method 1: Get from request object
+        # Try to extract URL and status code from the failure
         if hasattr(failure, 'request') and failure.request:
             failed_url = failure.request.url
-        elif hasattr(failure, 'value') and hasattr(failure.value, 'response') and failure.value.response:
-            # Sometimes the URL is in the response
-            failed_url = failure.value.response.url
-        else:
-            # Method 2: Try to extract from the failure string representation
-            failure_str = str(failure)
-            url_match = re.search(r'https?://[^\s\'"<>]+', failure_str)
-            if url_match:
-                failed_url = url_match.group(0)
-        
-        # Method 3: Check if it's in the request meta
-        if hasattr(failure, 'request') and failure.request and hasattr(failure.request, 'meta'):
-            if 'url' in failure.request.meta:
+            
+            # Check meta for original URL if available
+            if hasattr(failure.request, 'meta') and 'url' in failure.request.meta:
                 failed_url = failure.request.meta['url']
         
-        # Log the detailed error
-        error_type = type(failure.value).__name__ if hasattr(failure, 'value') else "Unknown"
-        error_msg = str(failure.value) if hasattr(failure, 'value') else str(failure)
+        # Extract status code from response if available
+        if hasattr(failure, 'value') and hasattr(failure.value, 'response') and failure.value.response:
+            response = failure.value.response
+            status_code = response.status
+            if not failed_url or failed_url == "Unknown URL":
+                failed_url = response.url
+        elif hasattr(failure, 'value') and hasattr(failure.value, 'status'):
+            # Some errors have status directly
+            status_code = failure.value.status
         
-        self.logger.error(f"❌ Product page request failed ({self.failed_count} total failures)")
-        self.logger.error(f"   URL: {failed_url}")
-        self.logger.error(f"   Error Type: {error_type}")
-        self.logger.error(f"   Error Message: {error_msg}")
+        # Get error type and message
+        if hasattr(failure, 'value'):
+            error_type = type(failure.value).__name__
+            error_msg = str(failure.value)
+               
+        # Log the detailed error with status code prominently displayed
+        self.logger.error("=" * 70)
+        self.logger.error(f"❌ ERROR #{self.failed_count} - Status Code: {status_code}")
+        self.logger.error("=" * 70)
+        self.logger.error(f"📍 URL: {failed_url}")
+        self.logger.error(f"📊 Status: {status_code}")
+        self.logger.error(f"📋 Error Type: {error_type}")
+        self.logger.error(f"📝 Message: {error_msg}")
         
-        # Log more details from Twisted Failure object
-        if hasattr(failure, 'getErrorMessage'):
-            self.logger.error(f"   Full Error: {failure.getErrorMessage()}")
+        # Additional details for specific status codes
+        if status_code == 404:
+            self.logger.error(f"💡 Page not found - The product might be discontinued")
+        elif status_code == 403:
+            self.logger.error(f"💡 Access forbidden - The server is blocking our request")
+        elif status_code == 429:
+            self.logger.error(f"💡 Rate limited - Too many requests, consider increasing DOWNLOAD_DELAY")
+        elif status_code == 500 or status_code == 502 or status_code == 503:
+            self.logger.error(f"💡 Server error - The website might be experiencing issues")
+        elif status_code == 301 or status_code == 302:
+            self.logger.error(f"💡 Redirect - The page has moved")
         
-        # Optional: Save failed URLs to a separate file for later retry
-        if not hasattr(self, 'failed_urls_file'):
-            self.failed_urls_file = open(f'failed_urls_{self.job_id}.txt', 'a')
-        self.failed_urls_file.write(f"{failed_url}\n")
-        self.failed_urls_file.flush()
+        # Log response headers for debugging (optional)
+        if hasattr(failure, 'value') and hasattr(failure.value, 'response') and failure.value.response:
+            headers = dict(failure.value.response.headers)
+            self.logger.debug(f"📋 Response Headers: {headers}")
+        
+        self.logger.error("=" * 70)
+        
+        # Track failed URLs with status codes for later analysis
+        if not hasattr(self, 'failed_urls_with_status'):
+            self.failed_urls_with_status = []
+        
+        self.failed_urls_with_status.append({
+            'url': failed_url,
+            'status': status_code,
+            'error_type': error_type,
+            'error_msg': error_msg,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Optionally save to file immediately
+        if not hasattr(self, 'failed_log_file'):
+            self.failed_log_file = open(f'failed_urls_{self.job_id}.csv', 'w')
+            self.failed_log_file.write("timestamp,url,status_code,error_type,error_message\n")
+        
+        self.failed_log_file.write(f"{datetime.now().isoformat()},{failed_url},{status_code},{error_type},{error_msg}\n")
+        self.failed_log_file.flush()
+    
 
     def closed(self, reason):
         """Log final stats when spider closes"""
