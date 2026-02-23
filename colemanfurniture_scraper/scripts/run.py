@@ -13,14 +13,14 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-# Suppress scrapy and twisted logging
-logging.getLogger("scrapy").setLevel(logging.CRITICAL)
-logging.getLogger("twisted").setLevel(logging.CRITICAL)
+# Suppress scrapy and twisted logging only for critical errors
+logging.getLogger("scrapy").setLevel(logging.WARNING)
+logging.getLogger("twisted").setLevel(logging.WARNING)
 
 logging.getLogger("twisted").propagate = False
-logging.getLogger("scrapy.core.engine").setLevel(logging.CRITICAL)
-logging.getLogger("scrapy.dupefilter").setLevel(logging.CRITICAL)
-logging.getLogger("scrapy.downloadermiddlewares").setLevel(logging.CRITICAL)
+logging.getLogger("scrapy.core.engine").setLevel(logging.WARNING)
+logging.getLogger("scrapy.dupefilter").setLevel(logging.WARNING)
+logging.getLogger("scrapy.downloadermiddlewares").setLevel(logging.WARNING)
 
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -48,6 +48,8 @@ def main():
                        help='Job identifier for output file')
     parser.add_argument('--output-dir', default='output',
                        help='Output directory for CSV files')
+    parser.add_argument('--verbose', action='store_true', default=False,
+                       help='Enable verbose logging with progress updates')
     
     args = parser.parse_args()
     
@@ -66,8 +68,16 @@ def main():
     
     download_delay = float(os.getenv('DOWNLOAD_DELAY', '0.1'))
     settings.set('DOWNLOAD_DELAY', download_delay)
-    settings.set('LOG_LEVEL', 'CRITICAL')
-    settings.set('LOG_ENABLED', False)
+    
+    # Configure logging based on verbose flag
+    if args.verbose:
+        settings.set('LOG_LEVEL', 'INFO')
+        settings.set('LOG_ENABLED', True)
+        logger.info("✅ Verbose logging enabled - full progress will be shown")
+    else:
+        settings.set('LOG_LEVEL', 'WARNING')
+        settings.set('LOG_ENABLED', True)
+    
     settings.set('LOG_FILE', None)
     settings.set('FEED_EXPORT_FIELDS', [
         'Ref Product URL',
@@ -94,18 +104,20 @@ def main():
     settings.set('DUPEFILTER_CLASS', 'scrapy.dupefilters.RFPDupeFilter')
     process = CrawlerProcess(settings)
     
-    logger.info(f"Starting scraper for: {args.website_url}")
-    logger.info(f"Output will be saved to: {output_file}")
-    logger.info(f"Job parameters: offset={args.sitemap_offset}, max_sitemaps={args.max_sitemaps}")
+    logger.info(f"🚀 Starting scraper for: {args.website_url}")
+    logger.info(f"📁 Output will be saved to: {output_file}")
+    logger.info(f"⚙️ Job parameters: offset={args.sitemap_offset}, max_sitemaps={args.max_sitemaps}, max_urls_per_sitemap={args.max_urls_per_sitemap}")
+    logger.info(f"🔧 Concurrency: {max_workers} workers, delay={download_delay}s")
     
     process.crawl(ProductFetcher,
                   website_url=args.website_url,
                   sitemap_offset=args.sitemap_offset,
                   max_sitemaps=args.max_sitemaps,
                   max_urls_per_sitemap=args.max_urls_per_sitemap,
-                  job_id=args.job_id)
+                  job_id=args.job_id,
+                  verbose=args.verbose)
     process.start()
-    logger.info(f"Scraping completed. Output saved to: {output_file}")
+    logger.info(f"✅ Scraping completed. Output saved to: {output_file}")
     return output_file
 
 if __name__ == '__main__':
