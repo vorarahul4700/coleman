@@ -78,11 +78,12 @@ class ProductFetcher(Spider):
         if not self.is_ashley:
             try:
                 sitemap_processor = SitemapProcessor()
+                
                 self.sitemap_index_url = sitemap_processor.get_sitemap_from_robots(self.website_url)
-                self.logger.info(f"Found sitemap index: {self.sitemap_index_url}")
+                self.logger.info(f"📍 Found sitemap index: {self.sitemap_index_url}")
                 
                 self.all_sitemaps = sitemap_processor.extract_all_sitemaps(self.sitemap_index_url)
-                self.logger.info(f"Total sitemaps discovered: {len(self.all_sitemaps)}")
+                self.logger.info(f"📚 Total sitemaps discovered: {len(self.all_sitemaps)}")
                 
                 self.sitemap_chunk = sitemap_processor.get_sitemap_chunks(
                     self.all_sitemaps, 
@@ -90,10 +91,10 @@ class ProductFetcher(Spider):
                     self.max_sitemaps
                 )
                 
-                self.logger.info(f"This job will process {len(self.sitemap_chunk)} sitemaps")
+                self.logger.info(f"🎯 This job will process {len(self.sitemap_chunk)} sitemaps")
                 
             except Exception as e:
-                self.logger.error(f"Failed to discover sitemap: {e}")
+                self.logger.error(f"❌ Failed to discover sitemap: {e}")
                 raise
     
     def get_headers(self):
@@ -135,10 +136,13 @@ class ProductFetcher(Spider):
                 start_idx = self.chunk_id * chunk_size
                 end_idx = start_idx + chunk_size if self.chunk_id < self.total_chunks - 1 else len(self.ashley_urls)
                 urls_to_process = self.ashley_urls[start_idx:end_idx]
+                self.total_urls_found = len(urls_to_process)
                 
-                self.logger.info(f"Ashley Chunk {self.chunk_id + 1}/{self.total_chunks}: Processing {len(urls_to_process)} URLs (indices {start_idx}-{end_idx-1})")
+                self.logger.info(f"📊 Ashley Chunk {self.chunk_id + 1}/{self.total_chunks}: Processing {len(urls_to_process)} URLs (indices {start_idx}-{end_idx-1})")
             else:
-                self.logger.info(f"Ashley mode: Processing {len(self.ashley_urls)} direct product URLs")
+                self.logger.info(f"📊 Ashley mode: Processing {len(self.ashley_urls)} direct product URLs")
+            
+            self.logger.info(f"🎯 Total URLs to process in this job: {self.total_urls_found}")
             
             # Create requests for each URL with Scrapy's built-in dupefilter
             for i, url in enumerate(urls_to_process):
@@ -146,7 +150,9 @@ class ProductFetcher(Spider):
                 
                 # Skip if already processed in this job
                 if normalized_url in self.processed_in_this_job:
-                    self.logger.info(f"⏭️ URL already processed in this job: {normalized_url}")
+                    self.skipped_count += 1
+                    if self.verbose:
+                        self.logger.info(f"⏭️ URL already processed in this job: {normalized_url}")
                     continue
                 
                 # Add to job tracking set
@@ -175,10 +181,10 @@ class ProductFetcher(Spider):
         
         # SITEMAP MODE for non-Ashley websites
         if not hasattr(self, 'sitemap_chunk') or not self.sitemap_chunk:
-            self.logger.error("No sitemaps to process")
+            self.logger.error("❌ No sitemaps to process")
             return
         
-        self.logger.info(f"Starting to process {len(self.sitemap_chunk)} sitemaps")
+        self.logger.info(f"🚀 Starting to process {len(self.sitemap_chunk)} sitemaps")
 
         for sitemap_url in self.sitemap_chunk:
             yield Request(
@@ -221,7 +227,9 @@ class ProductFetcher(Spider):
             
             # Check if URL already processed in this job
             if normalized_url in self.processed_in_this_job:
-                self.logger.info(f"⏭️ URL already processed in this job: {normalized_url}")
+                self.skipped_count += 1
+                if self.verbose:
+                    self.logger.info(f"⏭️ URL already processed in this job: {normalized_url}")
                 continue
             
             # Add to job tracking set
@@ -230,11 +238,11 @@ class ProductFetcher(Spider):
             yield Request(
                 url,
                 callback=self.parse_product_page_with_check,
-                meta={'url': url},
+                meta={'url': url, 'sitemap': sitemap_url},
                 errback=self.handle_product_error
             )
         
-        self.logger.info(f"Filtered {plp_count} PLP pages, {pdp_count} PDP pages to scrape")
+        self.logger.info(f"📊 Sitemap summary: {plp_count} PLP pages filtered out, {pdp_count} PDP pages to scrape")
     
     def _is_plp_url(self, url: str) -> bool:
         parsed_url = urlparse(url)
@@ -260,6 +268,17 @@ class ProductFetcher(Spider):
         elif normalized_url not in self.processed_in_this_job:
             # Add to tracking set if not already there
             self.processed_in_this_job.add(normalized_url)
+        
+        # Log progress periodically
+        current_time = time.time()
+        if current_time - self.last_log_time > self.log_interval:
+            self.log_progress()
+            self.last_log_time = current_time
+        
+        # Log every 100 items as well
+        if self.processed_count % 100 == 0:
+            success_rate = ((self.processed_count - self.failed_count) / self.processed_count * 100) if self.processed_count > 0 else 0
+            self.logger.info(f"📊 Progress: {self.processed_count}/{self.total_urls_found} URLs processed | ✅ Success: {self.processed_count - self.failed_count} | ⏭️ Skipped: {self.skipped_count} | ❌ Failed: {self.failed_count} | 📈 Rate: {success_rate:.1f}%")
         
         json_scripts = response.xpath('//script[@type="application/ld+json"]/text()').getall()
         has_product_json = False
@@ -298,11 +317,13 @@ class ProductFetcher(Spider):
                 continue
         
         if has_product_json:
-            self.logger.info(f"✅ Found Product JSON-LD for {response.url}")
+            if self.verbose:
+                self.logger.info(f"✅ Found Product JSON-LD for {response.url}")
             yield from self.parse_product_page(response)
             yield from self.extract_bundle_products(response)
         else:
-            self.logger.warning(f"⚠️ No Product JSON-LD found for {response.url}")
+            if self.verbose:
+                self.logger.warning(f"⚠️ No Product JSON-LD found for {response.url}")
             yield from self.parse_product_page(response)
     
     def extract_bundle_products(self, response):
@@ -326,26 +347,36 @@ class ProductFetcher(Spider):
                     sub_product_url = item.get('url')
                     item_short_name = item.get('itemShortName', '')
                     if not sub_product_url or sub_product_url == response.url:
-                        self.logger.info(f"Skipping self-reference or empty URL: {sub_product_url}")
+                        if self.verbose:
+                            self.logger.info(f"⏭️ Skipping self-reference or empty URL: {sub_product_url}")
                         continue
                     
                     normalized_url = self.normalize_url(sub_product_url)
                     
                     # Check if sub-product URL is already processed in this job
                     if normalized_url in self.processed_in_this_job:
-                        self.logger.info(f"⏭️ Bundle product already processed in this job: {item_short_name} - {normalized_url}")
+                        self.skipped_count += 1
+                        if self.verbose:
+                            self.logger.info(f"⏭️ Bundle product already processed: {item_short_name} - {normalized_url}")
                         continue
                     
                     # Add to job tracking set before yielding
                     self.processed_in_this_job.add(normalized_url)
+                    bundle_count += 1
                     
-                    self.logger.info(f"📦 Found unique sub-product: {item_short_name}")
+                    if self.verbose:
+                        self.logger.info(f"📦 Found bundle product #{bundle_count}: {item_short_name}")
+                    
                     yield Request(
                         sub_product_url,
                         callback=self.parse_product_page_with_check,
-                        meta={'url': sub_product_url},
+                        meta={'url': sub_product_url, 'is_bundle': True},
                         errback=self.handle_product_error
                     )
+            
+            if bundle_count > 0:
+                self.logger.info(f"📦 Added {bundle_count} bundle products from {response.url}")
+                
         except Exception as e:
             self.logger.error(f"Error extracting bundle products: {e}")
 
@@ -373,7 +404,50 @@ class ProductFetcher(Spider):
         item['Ref Images'] = self.extract_main_images(response)
         item['Ref Highlights'] = self.extract_highlights(response)
         item['Ref Dimensions'] = self.extract_dimensions(response)
+        
+        if self.verbose and sku:
+            self.logger.info(f"💾 Extracted product: {sku} - {item.get('Ref Product Name', '')[:50]}...")
+            
         yield item
+    
+    def log_progress(self):
+        """Log detailed progress information"""
+        elapsed = time.time() - self.start_time
+        rate = self.processed_count / elapsed if elapsed > 0 else 0
+        success_rate = ((self.processed_count - self.failed_count) / self.processed_count * 100) if self.processed_count > 0 else 0
+        
+        self.logger.info("=" * 70)
+        self.logger.info(f"📈 PROGRESS REPORT - Job: {self.job_id}")
+        self.logger.info(f"   Processed: {self.processed_count}/{self.total_urls_found} URLs ({self.processed_count/self.total_urls_found*100:.1f}% complete)" if self.total_urls_found > 0 else f"   Processed: {self.processed_count} URLs")
+        self.logger.info(f"   ✅ Successful: {self.processed_count - self.failed_count}")
+        self.logger.info(f"   ⏭️ Skipped (duplicates): {self.skipped_count}")
+        self.logger.info(f"   ❌ Failed: {self.failed_count}")
+        self.logger.info(f"   📊 Success rate: {success_rate:.1f}%")
+        self.logger.info(f"   ⚡ Speed: {rate:.2f} URLs/sec")
+        self.logger.info(f"   ⏱️ Elapsed: {self.format_time(elapsed)}")
+        
+        # Show sitemap breakdown if available
+        if self.sitemap_urls_count:
+            self.logger.info(f"   📚 Sitemap breakdown:")
+            for sitemap, count in list(self.sitemap_urls_count.items())[:5]:  # Show first 5 only
+                short_name = sitemap.split('/')[-1][:30]
+                self.logger.info(f"      - {short_name}: {count} URLs")
+            if len(self.sitemap_urls_count) > 5:
+                self.logger.info(f"      ... and {len(self.sitemap_urls_count) - 5} more sitemaps")
+        
+        self.logger.info("=" * 70)
+    
+    def format_time(self, seconds):
+        """Format time in seconds to HH:MM:SS"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m {secs}s"
+        elif minutes > 0:
+            return f"{minutes}m {secs}s"
+        else:
+            return f"{secs}s"
        
     def extract_product_name(self, response):
         json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
@@ -929,7 +1003,7 @@ class ProductFetcher(Spider):
             return cleaned
     
     def handle_sitemap_error(self, failure):
-        self.logger.error(f"Sitemap request failed: {failure.value}")
+        self.logger.error(f"❌ Sitemap request failed: {failure.value}")
     
     def handle_product_error(self, failure):
         self.failed_count += 1
@@ -992,5 +1066,25 @@ class ProductFetcher(Spider):
         self.logger.error("=" * 70)
 
     def closed(self, reason):
-        """Log stats when spider closes"""
-        self.logger.info(f"🛑 Spider closing. URLs processed in this job: {len(self.processed_in_this_job)}")
+        """Log final stats when spider closes"""
+        elapsed = time.time() - self.start_time
+        success_rate = ((self.processed_count - self.failed_count) / self.processed_count * 100) if self.processed_count > 0 else 0
+        rate = self.processed_count / elapsed if elapsed > 0 else 0
+        
+        self.logger.info("=" * 70)
+        self.logger.info(f"🏁 FINAL SCRAPING REPORT - Job: {self.job_id}")
+        self.logger.info(f"   📊 Summary:")
+        self.logger.info(f"      - Total URLs found: {self.total_urls_found}")
+        self.logger.info(f"      - URLs processed: {self.processed_count}")
+        self.logger.info(f"      - ✅ Successful: {self.processed_count - self.failed_count}")
+        self.logger.info(f"      - ⏭️ Skipped (duplicates): {self.skipped_count}")
+        self.logger.info(f"      - ❌ Failed: {self.failed_count}")
+        self.logger.info(f"   📈 Performance:")
+        self.logger.info(f"      - Success rate: {success_rate:.1f}%")
+        self.logger.info(f"      - Total time: {self.format_time(elapsed)}")
+        self.logger.info(f"      - Average speed: {rate:.2f} URLs/sec")
+        
+        if self.sitemap_urls_count:
+            self.logger.info(f"   📚 Sitemaps processed: {len(self.sitemap_urls_count)}")
+        
+        self.logger.info("=" * 70)
