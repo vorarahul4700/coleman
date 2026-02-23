@@ -1007,8 +1007,47 @@ class ProductFetcher(Spider):
     
     def handle_product_error(self, failure):
         self.failed_count += 1
-        self.logger.error(f"❌ Product page request failed ({self.failed_count} total failures): {failure.value}")
-    
+        
+        # Try to extract the URL from the failure
+        failed_url = "Unknown URL"
+        
+        # Method 1: Get from request object
+        if hasattr(failure, 'request') and failure.request:
+            failed_url = failure.request.url
+        elif hasattr(failure, 'value') and hasattr(failure.value, 'response') and failure.value.response:
+            # Sometimes the URL is in the response
+            failed_url = failure.value.response.url
+        else:
+            # Method 2: Try to extract from the failure string representation
+            failure_str = str(failure)
+            url_match = re.search(r'https?://[^\s\'"<>]+', failure_str)
+            if url_match:
+                failed_url = url_match.group(0)
+        
+        # Method 3: Check if it's in the request meta
+        if hasattr(failure, 'request') and failure.request and hasattr(failure.request, 'meta'):
+            if 'url' in failure.request.meta:
+                failed_url = failure.request.meta['url']
+        
+        # Log the detailed error
+        error_type = type(failure.value).__name__ if hasattr(failure, 'value') else "Unknown"
+        error_msg = str(failure.value) if hasattr(failure, 'value') else str(failure)
+        
+        self.logger.error(f"❌ Product page request failed ({self.failed_count} total failures)")
+        self.logger.error(f"   URL: {failed_url}")
+        self.logger.error(f"   Error Type: {error_type}")
+        self.logger.error(f"   Error Message: {error_msg}")
+        
+        # Log more details from Twisted Failure object
+        if hasattr(failure, 'getErrorMessage'):
+            self.logger.error(f"   Full Error: {failure.getErrorMessage()}")
+        
+        # Optional: Save failed URLs to a separate file for later retry
+        if not hasattr(self, 'failed_urls_file'):
+            self.failed_urls_file = open(f'failed_urls_{self.job_id}.txt', 'a')
+        self.failed_urls_file.write(f"{failed_url}\n")
+        self.failed_urls_file.flush()
+
     def closed(self, reason):
         """Log final stats when spider closes"""
         elapsed = time.time() - self.start_time
