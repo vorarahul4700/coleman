@@ -130,15 +130,14 @@ jobs:
             exit 1
           fi
           
-          # Run the scraper with verbose logging
+          # Run the scraper
           python colemanfurniture_scraper/scripts/run.py \
             --website-url "$CURR_URL" \
             --sitemap-offset $SITEMAP_OFFSET \
             --max-sitemaps $MAX_SITEMAPS \
             --max-urls-per-sitemap $MAX_URLS_PER_SITEMAP \
             --job-id "job${{ strategy.job-index }}" \
-            --output-dir output \
-            --verbose
+            --output-dir output
           
       - name: Rename output file
         run: |

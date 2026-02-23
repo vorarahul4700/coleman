@@ -104,20 +104,18 @@ def main():
     settings.set('DUPEFILTER_CLASS', 'scrapy.dupefilters.RFPDupeFilter')
     process = CrawlerProcess(settings)
     
-    logger.info(f"🚀 Starting scraper for: {args.website_url}")
-    logger.info(f"📁 Output will be saved to: {output_file}")
-    logger.info(f"⚙️ Job parameters: offset={args.sitemap_offset}, max_sitemaps={args.max_sitemaps}, max_urls_per_sitemap={args.max_urls_per_sitemap}")
-    logger.info(f"🔧 Concurrency: {max_workers} workers, delay={download_delay}s")
+    logger.info(f"Starting scraper for: {args.website_url}")
+    logger.info(f"Output will be saved to: {output_file}")
+    logger.info(f"Job parameters: offset={args.sitemap_offset}, max_sitemaps={args.max_sitemaps}")
     
     process.crawl(ProductFetcher,
                   website_url=args.website_url,
                   sitemap_offset=args.sitemap_offset,
                   max_sitemaps=args.max_sitemaps,
                   max_urls_per_sitemap=args.max_urls_per_sitemap,
-                  job_id=args.job_id,
-                  verbose=args.verbose)
+                  job_id=args.job_id)
     process.start()
-    logger.info(f"✅ Scraping completed. Output saved to: {output_file}")
+    logger.info(f"Scraping completed. Output saved to: {output_file}")
     return output_file
 
 if __name__ == '__main__':
