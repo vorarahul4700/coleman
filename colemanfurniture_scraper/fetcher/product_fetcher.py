@@ -1064,27 +1064,6 @@ class ProductFetcher(Spider):
             self.logger.debug(f"📋 Response Headers: {headers}")
         
         self.logger.error("=" * 70)
-        
-        # Track failed URLs with status codes for later analysis
-        if not hasattr(self, 'failed_urls_with_status'):
-            self.failed_urls_with_status = []
-        
-        self.failed_urls_with_status.append({
-            'url': failed_url,
-            'status': status_code,
-            'error_type': error_type,
-            'error_msg': error_msg,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        # Optionally save to file immediately
-        if not hasattr(self, 'failed_log_file'):
-            self.failed_log_file = open(f'failed_urls_{self.job_id}.csv', 'w')
-            self.failed_log_file.write("timestamp,url,status_code,error_type,error_message\n")
-        
-        self.failed_log_file.write(f"{datetime.now().isoformat()},{failed_url},{status_code},{error_type},{error_msg}\n")
-        self.failed_log_file.flush()
-    
 
     def closed(self, reason):
         """Log final stats when spider closes"""
