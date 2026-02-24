@@ -1,5 +1,9 @@
 name: Coleman and Homegallerystores Parallel Sitemap Scraper
 
+permissions:
+  contents: read
+  actions: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,7 +17,7 @@ on:
         default: "0"
         type: number
       sitemaps_per_job:
-        description: "Sitemaps per parallel job"
+        description: "Items per parallel job (sitemaps in round 1, URLs in retry rounds)"
         default: "2"
         type: number
       urls_per_sitemap:
@@ -25,9 +29,17 @@ on:
         default: "3"
         type: number
       max_rounds:
-        description: "Max retry rounds for remaining URLs"
+        description: "Max retry rounds"
         default: "5"
         type: number
+      recursion_level:
+        description: "Current recursion level"
+        default: "1"
+        type: number
+      remaining_file:
+        description: "FTP filename for remaining CSV (empty for initial run)"
+        default: ""
+        type: string
 
 jobs:
   plan:
@@ -35,6 +47,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       domain: ${{ steps.domain.outputs.domain }}
+      round: ${{ steps.round.outputs.round }}
     steps:
       - name: Extract domain
         id: domain
@@ -43,46 +56,134 @@ jobs:
           DOMAIN=$(echo "$URL" | sed -E 's|https?://||;s|/.*||' | sed 's/[^a-zA-Z0-9]/_/g')
           echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
           echo "Domain: $DOMAIN"
-          
-      - id: matrix
+
+      - name: Set round
+        id: round
         run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
-          URL="${{ github.event.inputs.website_url }}"
-          DOMAIN="${{ steps.domain.outputs.domain }}"
+          ROUND="${{ github.event.inputs.recursion_level }}"
+          echo "round=$ROUND" >> $GITHUB_OUTPUT
+          echo "Round: $ROUND"
 
-          # Auto-detect if total is 0
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "Auto-detecting sitemap count..."
-            # Try to fetch sitemap index
-            SITEMAP_URL="${URL}/sitemap.xml"
-            if curl -s -f -o /dev/null "$SITEMAP_URL"; then
-              # Count sitemaps in index
-              TOTAL=$(curl -s "$SITEMAP_URL" | grep -o "<loc>[^<]*</loc>" | wc -l)
-              echo "Found $TOTAL sitemaps"
-            else
-              TOTAL=5  # Fallback
-              echo "Could not detect, using fallback: $TOTAL"
+      - id: matrix
+        env:
+          URL: ${{ github.event.inputs.website_url }}
+          DOMAIN: ${{ steps.domain.outputs.domain }}
+          TOTAL: ${{ github.event.inputs.total_sitemaps }}
+          PER_JOB: ${{ github.event.inputs.sitemaps_per_job }}
+          REMAINING_FILE: ${{ github.event.inputs.remaining_file }}
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_PATH: ${{ secrets.FTP_PATH }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
+        run: |
+          if [ -n "$REMAINING_FILE" ]; then
+            echo "Planning retry round from FTP remaining file: $REMAINING_FILE"
+            MATRIX=$(python3 - <<'PY'
+          import csv
+          import ftplib
+          import json
+          import os
+          import sys
+
+          remaining_file = os.environ.get("REMAINING_FILE", "").strip()
+          if not remaining_file:
+              print("[]")
+              sys.exit(0)
+
+          host = os.environ.get("FTP_HOST", "").strip()
+          user = os.environ.get("FTP_USER", "").strip()
+          password = os.environ.get("FTP_PASS", "").strip()
+          ftp_path = os.environ.get("FTP_PATH", "/").strip() or "/"
+          ftp_port = int((os.environ.get("FTP_PORT", "21") or "21").strip())
+
+          if not host or not user or not password:
+              raise RuntimeError("FTP credentials are required for retry rounds")
+
+          local_file = "remaining_input.csv"
+          ftp = ftplib.FTP()
+          ftp.connect(host, ftp_port)
+          ftp.login(user, password)
+          ftp.set_pasv(True)
+          if ftp_path and ftp_path != "/":
+              ftp.cwd(ftp_path)
+          with open(local_file, "wb") as f:
+              ftp.retrbinary(f"RETR {remaining_file}", f.write)
+          ftp.quit()
+
+          urls = []
+          with open(local_file, "r", newline="", encoding="utf-8") as f:
+              reader = csv.DictReader(f)
+              for row in reader:
+                  url = (row.get("url") or row.get("Ref Product URL") or "").strip()
+                  if url:
+                      urls.append(url)
+
+          # de-duplicate while keeping order
+          seen = set()
+          deduped = []
+          for u in urls:
+              if u in seen:
+                  continue
+              seen.add(u)
+              deduped.append(u)
+
+          per_job = max(1, int(os.environ.get("PER_JOB", "1") or "1"))
+          chunks = [deduped[i:i + per_job] for i in range(0, len(deduped), per_job)]
+
+          if not chunks:
+              print("[]")
+              sys.exit(0)
+
+          matrix = []
+          for idx, chunk in enumerate(chunks):
+              matrix.append({
+                  "mode": "remaining",
+                  "part_id": idx,
+                  "url": os.environ["URL"],
+                  "domain": os.environ["DOMAIN"],
+                  "urls_json": json.dumps(chunk),
+              })
+
+          print(json.dumps(matrix))
+          PY
+            )
+          else
+            echo "Planning initial sitemap round"
+            TOTAL="$TOTAL"
+            if [ "$TOTAL" -eq 0 ]; then
+              echo "Auto-detecting sitemap count..."
+              SITEMAP_URL="${URL}/sitemap.xml"
+              if curl -s -f -o /dev/null "$SITEMAP_URL"; then
+                TOTAL=$(curl -s "$SITEMAP_URL" | grep -o "<loc>[^<]*</loc>" | wc -l)
+                echo "Found $TOTAL sitemaps"
+              else
+                TOTAL=5
+                echo "Could not detect, using fallback: $TOTAL"
+              fi
             fi
+
+            JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
+            [ "$JOBS" -eq 0 ] && JOBS=1
+
+            MATRIX="["
+            for ((i=0;i<JOBS;i++)); do
+              OFFSET=$(( i * PER_JOB ))
+              LIMIT=$PER_JOB
+              if [ $i -eq $((JOBS - 1)) ]; then
+                LIMIT=$(( TOTAL - OFFSET ))
+              fi
+              MATRIX+="{\"mode\":\"sitemap\",\"part_id\":$OFFSET,\"offset\":$OFFSET,\"limit\":$LIMIT,\"url\":\"$URL\",\"domain\":\"$DOMAIN\"},"
+            done
+            MATRIX="${MATRIX%,}]"
           fi
-          
-          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
-          [ $JOBS -eq 0 ] && JOBS=1
 
-          MATRIX="["
-          for ((i=0;i<JOBS;i++)); do
-            OFFSET=$(( i * PER_JOB ))
-            LIMIT=$PER_JOB
-            # Last job gets remaining
-            if [ $i -eq $((JOBS - 1)) ]; then
-              LIMIT=$(( TOTAL - OFFSET ))
-            fi
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$LIMIT,\"url\":\"$URL\",\"domain\":\"$DOMAIN\"},"
-          done
-          MATRIX="${MATRIX%,}]"
+          if [ -z "$MATRIX" ] || [ "$MATRIX" = "[]" ]; then
+            MATRIX='[{"mode":"remaining","part_id":0,"offset":0,"limit":0,"url":"'"$URL"'","domain":"'"$DOMAIN"'","urls_json":"[]"}]'
+          fi
 
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Total sitemaps: $TOTAL, Jobs: $JOBS"
+          echo "Matrix: $MATRIX"
 
   scrape:
     needs: plan
@@ -94,12 +195,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -108,182 +209,184 @@ jobs:
           else
             pip install scrapy pandas lxml requests beautifulsoup4
           fi
-          
+
       - name: Create output directory
         run: mkdir -p output
-          
-      - name: Run scraper job
+
+      - name: Run scraper chunk
         env:
           CURR_URL: ${{ matrix.url }}
+          PART_ID: ${{ matrix.part_id }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
           MAX_SITEMAPS: ${{ matrix.limit }}
+          MODE: ${{ matrix.mode }}
+          URLS_JSON: ${{ matrix.urls_json }}
+          DOMAIN: ${{ matrix.domain }}
+          ROUND: ${{ needs.plan.outputs.round }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
-          MAX_ROUNDS: ${{ github.event.inputs.max_rounds }}
         run: |
-          echo "=== Job ${{ strategy.job-index }} ==="
+          echo "=== Job ${{ strategy.job-index }} | round $ROUND | mode $MODE ==="
           echo "Website: $CURR_URL"
-          echo "Offset: $SITEMAP_OFFSET"
-          echo "Max sitemaps: $MAX_SITEMAPS"
-          echo "Max URLs per sitemap: $MAX_URLS_PER_SITEMAP"
-          echo "Max workers: $MAX_WORKERS"
-          echo "Max rounds: $MAX_ROUNDS"
-          echo "Domain: ${{ matrix.domain }}"
-          
-          # Check if script exists
-          if [ ! -f "colemanfurniture_scraper/scripts/run.py" ]; then
-            echo "❌ Script not found: colemanfurniture_scraper/scripts/run.py"
-            exit 1
-          fi
+          echo "Part: $PART_ID"
 
           TIMESTAMP="${GITHUB_RUN_ID:-local}"
-          ROUND=1
-          URLS_FILE=""
-          ROUND_OUTPUTS=()
-          FINAL_REMAINING=""
+          JOB_ID="r${ROUND}_job${{ strategy.job-index }}"
+          RUN_OUTPUT="output/output_${DOMAIN}_${JOB_ID}_${TIMESTAMP}.csv"
+          RUN_REMAINING="output/remaining_${DOMAIN}_${JOB_ID}_${TIMESTAMP}.csv"
 
-          while [ "$ROUND" -le "$MAX_ROUNDS" ]; do
-            JOB_ID="job${{ strategy.job-index }}_r${ROUND}"
-            RUN_OUTPUT="output/output_${{ matrix.domain }}_${JOB_ID}_${TIMESTAMP}.csv"
-            RUN_REMAINING="output/remaining_${{ matrix.domain }}_${JOB_ID}_${TIMESTAMP}.csv"
+          if [ "$MODE" = "remaining" ]; then
+            URLS_COUNT=$(python3 - <<'PY'
+          import json
+          import os
+          urls = []
+          raw = os.environ.get("URLS_JSON")
+          if raw:
+              urls = json.loads(raw)
+          with open("output/retry_urls.json", "w", encoding="utf-8") as f:
+              json.dump({"urls": urls}, f)
+          print(len(urls))
+          PY
+            )
+            echo "Retry URLs in this chunk: $URLS_COUNT"
 
-            echo "--- Round $ROUND ---"
-            if [ -n "$URLS_FILE" ]; then
-              echo "Retrying from remaining file: $URLS_FILE"
+            if [ "$URLS_COUNT" -gt 0 ]; then
               python colemanfurniture_scraper/scripts/run.py \
                 --website-url "$CURR_URL" \
-                --sitemap-offset $SITEMAP_OFFSET \
-                --max-sitemaps $MAX_SITEMAPS \
-                --max-urls-per-sitemap $MAX_URLS_PER_SITEMAP \
                 --job-id "$JOB_ID" \
                 --output-dir output \
-                --urls-file "$URLS_FILE" \
-                --verbose
-            else
-              echo "Initial round from sitemap inputs"
-              python colemanfurniture_scraper/scripts/run.py \
-                --website-url "$CURR_URL" \
-                --sitemap-offset $SITEMAP_OFFSET \
-                --max-sitemaps $MAX_SITEMAPS \
-                --max-urls-per-sitemap $MAX_URLS_PER_SITEMAP \
-                --job-id "$JOB_ID" \
-                --output-dir output \
+                --urls-file output/retry_urls.json \
                 --verbose
             fi
-
-            if [ -f "$RUN_OUTPUT" ] && [ -s "$RUN_OUTPUT" ]; then
-              ROUND_OUTPUTS+=("$RUN_OUTPUT")
-            fi
-
-            if [ -f "$RUN_REMAINING" ] && [ "$(wc -l < "$RUN_REMAINING")" -gt 1 ]; then
-              FINAL_REMAINING="$RUN_REMAINING"
-              URLS_FILE="$RUN_REMAINING"
-              REM_ROWS=$(($(wc -l < "$RUN_REMAINING") - 1))
-              echo "Round $ROUND produced remaining rows: $REM_ROWS"
-              ROUND=$((ROUND + 1))
-            else
-              echo "No remaining rows after round $ROUND"
-              FINAL_REMAINING=""
-              break
-            fi
-          done
-
-          FINAL_OUTPUT="output/${{ matrix.domain }}_offset_${{ matrix.offset }}.csv"
-          if [ "${#ROUND_OUTPUTS[@]}" -eq 0 ]; then
-            echo "No output CSV files found across rounds; creating empty output"
-            echo "Ref Product URL,Ref Product ID,Ref Variant ID,Ref Category,Ref Category URL,Ref Brand Name,Ref Product Name,Ref SKU,Ref MPN,Ref GTIN,Ref Price,Ref Main Image,Ref Quantity,Ref Group Attr 1,Ref Group Attr 2,Ref Images,Ref Dimensions,Ref Status,Ref Highlights,Date Scrapped" > "$FINAL_OUTPUT"
           else
-            FIRST_FILE="${ROUND_OUTPUTS[0]}"
-            head -n 1 "$FIRST_FILE" > "$FINAL_OUTPUT"
-            for f in "${ROUND_OUTPUTS[@]}"; do
-              if [ -s "$f" ] && [ "$(wc -l < "$f")" -gt 1 ]; then
-                tail -n +2 "$f" >> "$FINAL_OUTPUT"
-              fi
-            done
+            python colemanfurniture_scraper/scripts/run.py \
+              --website-url "$CURR_URL" \
+              --sitemap-offset "$SITEMAP_OFFSET" \
+              --max-sitemaps "$MAX_SITEMAPS" \
+              --max-urls-per-sitemap "$MAX_URLS_PER_SITEMAP" \
+              --job-id "$JOB_ID" \
+              --output-dir output \
+              --verbose
           fi
 
-          echo "Final per-job output: $FINAL_OUTPUT"
+          FINAL_OUTPUT="output/${DOMAIN}_part_${PART_ID}.csv"
+          if [ -f "$RUN_OUTPUT" ] && [ -s "$RUN_OUTPUT" ]; then
+            cp "$RUN_OUTPUT" "$FINAL_OUTPUT"
+          else
+            echo "Ref Product URL,Ref Product ID,Ref Variant ID,Ref Category,Ref Category URL,Ref Brand Name,Ref Product Name,Ref SKU,Ref MPN,Ref GTIN,Ref Price,Ref Main Image,Ref Quantity,Ref Group Attr 1,Ref Group Attr 2,Ref Images,Ref Dimensions,Ref Status,Ref Highlights,Date Scrapped" > "$FINAL_OUTPUT"
+          fi
 
-          if [ -n "$FINAL_REMAINING" ] && [ -f "$FINAL_REMAINING" ]; then
-            cp "$FINAL_REMAINING" "output/${{ matrix.domain }}_offset_${{ matrix.offset }}_remaining.csv"
-            echo "Final remaining file copied to output/${{ matrix.domain }}_offset_${{ matrix.offset }}_remaining.csv"
+          if [ -f "$RUN_REMAINING" ] && [ "$(wc -l < "$RUN_REMAINING")" -gt 1 ]; then
+            cp "$RUN_REMAINING" "output/${DOMAIN}_part_${PART_ID}_remaining.csv"
           fi
 
       - name: Upload chunk artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.domain }}_offset_${{ matrix.offset }}
-          path: output/${{ matrix.domain }}_offset_${{ matrix.offset }}.csv
+          name: ${{ matrix.domain }}_part_${{ matrix.part_id }}_round_${{ needs.plan.outputs.round }}
+          path: |
+            output/${{ matrix.domain }}_part_${{ matrix.part_id }}.csv
+            output/${{ matrix.domain }}_part_${{ matrix.part_id }}_remaining.csv
+          if-no-files-found: warn
           retention-days: 1
 
   merge:
-    needs: scrape
+    needs: [plan, scrape]
     runs-on: ubuntu-latest
     outputs:
       filename: ${{ steps.meta.outputs.name }}
-      
+      remaining_rows: ${{ steps.remaining.outputs.rows }}
+      remaining_file: ${{ steps.remaining.outputs.file }}
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: chunks
-          
-      - name: Merge CSVs
+
+      - name: Merge product CSVs
         run: |
-          echo "=== Merging CSV files ==="
-          
-          # Find all CSV files
-          CSV_FILES=$(find chunks -name "*.csv" -type f)
-          
+          echo "=== Merging product CSV files ==="
+          CSV_FILES=$(find chunks -name "*_part_*.csv" -type f | grep -v "_remaining.csv" || true)
+
           if [ -z "$CSV_FILES" ]; then
-            echo "No CSV files found to merge"
-            # Create empty CSV with headers
-            echo "Ref Product URL,Ref Product ID,Ref Variant ID,Ref Category,Ref Category URL,Ref Brand Name,Ref Product Name,Ref SKU,Ref MPN,Ref GTIN,Ref Price,Ref Main Image,Ref Quantity,Ref Group Attr 1,Ref Group Attr 2,Ref Status,Date Scrapped" > products_full.csv
-            echo "Created empty CSV"
+            echo "No product CSV files found"
+            echo "Ref Product URL,Ref Product ID,Ref Variant ID,Ref Category,Ref Category URL,Ref Brand Name,Ref Product Name,Ref SKU,Ref MPN,Ref GTIN,Ref Price,Ref Main Image,Ref Quantity,Ref Group Attr 1,Ref Group Attr 2,Ref Images,Ref Dimensions,Ref Status,Ref Highlights,Date Scrapped" > products_full.csv
           else
-            echo "Found $(echo "$CSV_FILES" | wc -l) CSV files"
-            
-            # Get first file for headers
             FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
-            echo "Using headers from: $FIRST_FILE"
-            
-            # Extract headers (first line)
             head -n 1 "$FIRST_FILE" > products_full.csv
-            
-            # Merge all files (skip headers)
-            TOTAL_ROWS=0
             for f in $CSV_FILES; do
-              echo "Merging: $f"
               if [ -s "$f" ] && [ "$(wc -l < "$f")" -gt 1 ]; then
-                FILE_ROWS=$(tail -n +2 "$f" | sed '/^$/d' | wc -l)
-                TOTAL_ROWS=$((TOTAL_ROWS + FILE_ROWS))
                 tail -n +2 "$f" | sed '/^$/d' >> products_full.csv
               fi
             done
-            
-            echo "Merged $TOTAL_ROWS rows"
           fi
-          
+
+      - name: Merge remaining CSVs
+        id: remaining
+        run: |
+          REM_ROWS=$(python3 - <<'PY'
+          import csv
+          import glob
+
+          files = glob.glob("chunks/**/*_part_*_remaining.csv", recursive=True)
+          fields = ["url", "status", "error_type", "error_message", "failed_at", "job_id", "chunk_id"]
+          rows = {}
+
+          for path in files:
+              with open(path, "r", newline="", encoding="utf-8") as f:
+                  reader = csv.DictReader(f)
+                  for row in reader:
+                      url = (row.get("url") or "").strip()
+                      if not url:
+                          continue
+                      rows[url] = {k: row.get(k, "") for k in fields}
+
+          with open("remaining_full.csv", "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for row in rows.values():
+                  writer.writerow(row)
+
+          print(len(rows))
+          PY
+          )
+          echo "rows=$REM_ROWS" >> $GITHUB_OUTPUT
+
+          ROUND="${{ needs.plan.outputs.round }}"
+          CLEAN_DOMAIN=$(echo "${{ github.event.inputs.website_url }}" | sed -E 's|https?://||' | sed 's|/.*||' | sed 's/\./_/g')
+          REM_FILE="${CLEAN_DOMAIN}_remaining_round_${ROUND}.csv"
+          echo "file=$REM_FILE" >> $GITHUB_OUTPUT
+
+          echo "Merged remaining rows: $REM_ROWS"
+
       - name: Build output filename
         id: meta
         run: |
-          # Extract the original URL from the plan step or input
           ORIGINAL_URL="${{ github.event.inputs.website_url }}"
-          # Extract domain without protocol and replace dots with underscores
           CLEAN_DOMAIN=$(echo "$ORIGINAL_URL" | sed -E 's|https?://||' | sed 's|/.*||' | sed 's/\./_/g')
           DATE=$(date +%F)
-          FILENAME="${CLEAN_DOMAIN}_${DATE}.csv"
+          ROUND="${{ needs.plan.outputs.round }}"
+          FILENAME="${CLEAN_DOMAIN}_${DATE}_round_${ROUND}.csv"
           echo "name=$FILENAME" >> $GITHUB_OUTPUT
           echo "Generated filename: $FILENAME"
-          
+
       - name: Upload final CSV artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}
           path: products_full.csv
           retention-days: 7
-          
-      - name: Upload to FTP server
+
+      - name: Upload remaining CSV artifact
+        if: ${{ steps.remaining.outputs.rows != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.remaining.outputs.file }}
+          path: remaining_full.csv
+          retention-days: 7
+
+      - name: Upload final CSV to FTP server
         if: success()
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
@@ -292,15 +395,9 @@ jobs:
           FTP_BASE_DIR: ${{ secrets.FTP_PATH }}
           FILE: ${{ steps.meta.outputs.name }}
         run: |
-          echo "=== Uploading to FTP ==="
-          echo "FTP Host: $FTP_HOST"
-          echo "File: $FILE"
-          
-          # Install lftp
+          echo "=== Uploading final CSV to FTP ==="
           sudo apt-get update && sudo apt-get install -y lftp
-          
-          # Upload file
-          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF2
           set ftp:ssl-allow no
           set ssl:verify-certificate no
           mkdir -p $FTP_BASE_DIR
@@ -308,12 +405,59 @@ jobs:
           put products_full.csv -o $FILE
           ls -la $FILE
           bye
-          EOF
-          
-          echo "✅ File uploaded successfully: $FILE"
-          
+          EOF2
+
+      - name: Upload remaining CSV to FTP server
+        if: ${{ steps.remaining.outputs.rows != '0' }}
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_BASE_DIR: ${{ secrets.FTP_PATH }}
+          REM_FILE: ${{ steps.remaining.outputs.file }}
+        run: |
+          echo "=== Uploading remaining CSV to FTP ==="
+          sudo apt-get update && sudo apt-get install -y lftp
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF2
+          set ftp:ssl-allow no
+          set ssl:verify-certificate no
+          mkdir -p $FTP_BASE_DIR
+          cd $FTP_BASE_DIR
+          put remaining_full.csv -o $REM_FILE
+          ls -la $REM_FILE
+          bye
+          EOF2
+
+      - name: Trigger next recursion round
+        if: ${{ steps.remaining.outputs.rows != '0' && fromJSON(github.event.inputs.recursion_level) < fromJSON(github.event.inputs.max_rounds) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_LEVEL: ${{ fromJSON(github.event.inputs.recursion_level) + 1 }}
+          REM_FILE: ${{ steps.remaining.outputs.file }}
+        run: |
+          echo "Triggering next round: $NEXT_LEVEL with remaining file $REM_FILE"
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/colemanfurniture.yml/dispatches \
+            -d @- <<JSON
+          {
+            "ref": "${{ github.ref_name }}",
+            "inputs": {
+              "website_url": "${{ github.event.inputs.website_url }}",
+              "total_sitemaps": "${{ github.event.inputs.total_sitemaps }}",
+              "sitemaps_per_job": "${{ github.event.inputs.sitemaps_per_job }}",
+              "urls_per_sitemap": "${{ github.event.inputs.urls_per_sitemap }}",
+              "max_workers": "${{ github.event.inputs.max_workers }}",
+              "max_rounds": "${{ github.event.inputs.max_rounds }}",
+              "recursion_level": "$NEXT_LEVEL",
+              "remaining_file": "$REM_FILE"
+            }
+          }
+          JSON
+
       - name: Cleanup
         if: always()
         run: |
-          rm -rf chunks output products_full.csv
+          rm -rf chunks output products_full.csv remaining_full.csv remaining_input.csv
           echo "Cleanup completed"
