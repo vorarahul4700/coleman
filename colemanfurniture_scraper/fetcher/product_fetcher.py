@@ -2,6 +2,7 @@ import gzip
 import xml.etree.ElementTree as ET
 import json
 import re
+import csv
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 from scrapy import Spider, Request
@@ -68,6 +69,7 @@ class ProductFetcher(Spider):
         self.processed_count = 0
         self.skipped_count = 0
         self.failed_count = 0
+        self.failed_requests = {}
         self.last_log_time = self.start_time
         self.log_interval = 30  # Log progress every 30 seconds
         self.sitemap_urls_count = {}  # Track URLs per sitemap
@@ -1004,6 +1006,28 @@ class ProductFetcher(Spider):
     
     def handle_sitemap_error(self, failure):
         self.logger.error(f"❌ Sitemap request failed: {failure.value}")
+
+    def _get_remaining_file_path(self):
+        feed_uri = ""
+        if hasattr(self, "crawler") and getattr(self, "crawler", None):
+            feed_uri = self.crawler.settings.get("FEED_URI", "") or ""
+
+        if feed_uri:
+            feed_dir = os.path.dirname(feed_uri) or "."
+            feed_name = os.path.basename(feed_uri)
+            feed_stem, _ = os.path.splitext(feed_name)
+            if feed_stem.startswith("output_"):
+                remaining_name = feed_stem.replace("output_", "remaining_", 1) + ".csv"
+            else:
+                remaining_name = f"{feed_stem}_remaining.csv"
+            return os.path.join(feed_dir, remaining_name)
+
+        fallback_dir = "output"
+        os.makedirs(fallback_dir, exist_ok=True)
+        return os.path.join(
+            fallback_dir,
+            f"remaining_{self.base_domain}_{self.job_id}.csv"
+        )
     
     def handle_product_error(self, failure):
         self.failed_count += 1
@@ -1036,6 +1060,16 @@ class ProductFetcher(Spider):
         if hasattr(failure, 'value'):
             error_type = type(failure.value).__name__
             error_msg = str(failure.value)
+
+        failed_url = failed_url or "Unknown URL"
+        failed_url_key = failed_url if failed_url != "Unknown URL" else f"unknown_{self.failed_count}"
+        self.failed_requests[failed_url_key] = {
+            "url": failed_url,
+            "status": str(status_code),
+            "error_type": error_type,
+            "error_message": error_msg,
+            "failed_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
                
         # Log the detailed error with status code prominently displayed
         self.logger.error("=" * 70)
@@ -1070,6 +1104,35 @@ class ProductFetcher(Spider):
         elapsed = time.time() - self.start_time
         success_rate = ((self.processed_count - self.failed_count) / self.processed_count * 100) if self.processed_count > 0 else 0
         rate = self.processed_count / elapsed if elapsed > 0 else 0
+
+        remaining_file = None
+        if self.failed_requests:
+            remaining_file = self._get_remaining_file_path()
+            os.makedirs(os.path.dirname(remaining_file) or ".", exist_ok=True)
+            with open(remaining_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "url",
+                        "status",
+                        "error_type",
+                        "error_message",
+                        "failed_at",
+                        "job_id",
+                        "chunk_id",
+                    ]
+                )
+                writer.writeheader()
+                for row in self.failed_requests.values():
+                    writer.writerow({
+                        "url": row.get("url", ""),
+                        "status": row.get("status", ""),
+                        "error_type": row.get("error_type", ""),
+                        "error_message": row.get("error_message", ""),
+                        "failed_at": row.get("failed_at", ""),
+                        "job_id": self.job_id,
+                        "chunk_id": self.chunk_id,
+                    })
         
         self.logger.info("=" * 70)
         self.logger.info(f"🏁 FINAL SCRAPING REPORT - Job: {self.job_id}")
@@ -1079,6 +1142,9 @@ class ProductFetcher(Spider):
         self.logger.info(f"      - ✅ Successful: {self.processed_count - self.failed_count}")
         self.logger.info(f"      - ⏭️ Skipped (duplicates): {self.skipped_count}")
         self.logger.info(f"      - ❌ Failed: {self.failed_count}")
+        if remaining_file:
+            self.logger.info(f"      - 🔁 Remaining file: {remaining_file}")
+            print(f"REMAINING_FILE={remaining_file}")
         self.logger.info(f"   📈 Performance:")
         self.logger.info(f"      - Success rate: {success_rate:.1f}%")
         self.logger.info(f"      - Total time: {self.format_time(elapsed)}")

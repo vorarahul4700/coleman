@@ -24,6 +24,10 @@ on:
         description: "Max concurrent workers per job"
         default: "3"
         type: number
+      max_rounds:
+        description: "Max retry rounds for remaining URLs"
+        default: "5"
+        type: number
 
 jobs:
   plan:
@@ -115,6 +119,7 @@ jobs:
           MAX_SITEMAPS: ${{ matrix.limit }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
+          MAX_ROUNDS: ${{ github.event.inputs.max_rounds }}
         run: |
           echo "=== Job ${{ strategy.job-index }} ==="
           echo "Website: $CURR_URL"
@@ -122,6 +127,7 @@ jobs:
           echo "Max sitemaps: $MAX_SITEMAPS"
           echo "Max URLs per sitemap: $MAX_URLS_PER_SITEMAP"
           echo "Max workers: $MAX_WORKERS"
+          echo "Max rounds: $MAX_ROUNDS"
           echo "Domain: ${{ matrix.domain }}"
           
           # Check if script exists
@@ -129,33 +135,78 @@ jobs:
             echo "❌ Script not found: colemanfurniture_scraper/scripts/run.py"
             exit 1
           fi
-          
-          # Run the scraper with verbose logging
-          python colemanfurniture_scraper/scripts/run.py \
-            --website-url "$CURR_URL" \
-            --sitemap-offset $SITEMAP_OFFSET \
-            --max-sitemaps $MAX_SITEMAPS \
-            --max-urls-per-sitemap $MAX_URLS_PER_SITEMAP \
-            --job-id "job${{ strategy.job-index }}" \
-            --output-dir output \
-            --verbose
-          
-      - name: Rename output file
-        run: |
-          echo "Renaming output file..."
-          mkdir -p output
-          
-          # Check if any CSV files exist
-          if ls output/*.csv 1> /dev/null 2>&1; then
-            CSV_FILE=$(ls output/*.csv | head -n 1)
-            echo "Found CSV: $CSV_FILE"
-            NEW_NAME="output/${{ matrix.domain }}_offset_${{ matrix.offset }}.csv"
-            mv "$CSV_FILE" "$NEW_NAME"
-            echo "Renamed to: $NEW_NAME"
+
+          TIMESTAMP="${GITHUB_RUN_ID:-local}"
+          ROUND=1
+          URLS_FILE=""
+          ROUND_OUTPUTS=()
+          FINAL_REMAINING=""
+
+          while [ "$ROUND" -le "$MAX_ROUNDS" ]; do
+            JOB_ID="job${{ strategy.job-index }}_r${ROUND}"
+            RUN_OUTPUT="output/output_${{ matrix.domain }}_${JOB_ID}_${TIMESTAMP}.csv"
+            RUN_REMAINING="output/remaining_${{ matrix.domain }}_${JOB_ID}_${TIMESTAMP}.csv"
+
+            echo "--- Round $ROUND ---"
+            if [ -n "$URLS_FILE" ]; then
+              echo "Retrying from remaining file: $URLS_FILE"
+              python colemanfurniture_scraper/scripts/run.py \
+                --website-url "$CURR_URL" \
+                --sitemap-offset $SITEMAP_OFFSET \
+                --max-sitemaps $MAX_SITEMAPS \
+                --max-urls-per-sitemap $MAX_URLS_PER_SITEMAP \
+                --job-id "$JOB_ID" \
+                --output-dir output \
+                --urls-file "$URLS_FILE" \
+                --verbose
+            else
+              echo "Initial round from sitemap inputs"
+              python colemanfurniture_scraper/scripts/run.py \
+                --website-url "$CURR_URL" \
+                --sitemap-offset $SITEMAP_OFFSET \
+                --max-sitemaps $MAX_SITEMAPS \
+                --max-urls-per-sitemap $MAX_URLS_PER_SITEMAP \
+                --job-id "$JOB_ID" \
+                --output-dir output \
+                --verbose
+            fi
+
+            if [ -f "$RUN_OUTPUT" ] && [ -s "$RUN_OUTPUT" ]; then
+              ROUND_OUTPUTS+=("$RUN_OUTPUT")
+            fi
+
+            if [ -f "$RUN_REMAINING" ] && [ "$(wc -l < "$RUN_REMAINING")" -gt 1 ]; then
+              FINAL_REMAINING="$RUN_REMAINING"
+              URLS_FILE="$RUN_REMAINING"
+              REM_ROWS=$(($(wc -l < "$RUN_REMAINING") - 1))
+              echo "Round $ROUND produced remaining rows: $REM_ROWS"
+              ROUND=$((ROUND + 1))
+            else
+              echo "No remaining rows after round $ROUND"
+              FINAL_REMAINING=""
+              break
+            fi
+          done
+
+          FINAL_OUTPUT="output/${{ matrix.domain }}_offset_${{ matrix.offset }}.csv"
+          if [ "${#ROUND_OUTPUTS[@]}" -eq 0 ]; then
+            echo "No output CSV files found across rounds; creating empty output"
+            echo "Ref Product URL,Ref Product ID,Ref Variant ID,Ref Category,Ref Category URL,Ref Brand Name,Ref Product Name,Ref SKU,Ref MPN,Ref GTIN,Ref Price,Ref Main Image,Ref Quantity,Ref Group Attr 1,Ref Group Attr 2,Ref Images,Ref Dimensions,Ref Status,Ref Highlights,Date Scrapped" > "$FINAL_OUTPUT"
           else
-            echo "No CSV files found in output directory"
-            # Create empty file with headers
-            echo "Ref Product URL,Ref Product ID,Ref Variant ID,Ref Category,Ref Category URL,Ref Brand Name,Ref Product Name,Ref SKU,Ref MPN,Ref GTIN,Ref Price,Ref Main Image,Ref Quantity,Ref Group Attr 1,Ref Group Attr 2,Ref Status,Date Scrapped" > "output/${{ matrix.domain }}_offset_${{ matrix.offset }}.csv"
+            FIRST_FILE="${ROUND_OUTPUTS[0]}"
+            head -n 1 "$FIRST_FILE" > "$FINAL_OUTPUT"
+            for f in "${ROUND_OUTPUTS[@]}"; do
+              if [ -s "$f" ] && [ "$(wc -l < "$f")" -gt 1 ]; then
+                tail -n +2 "$f" >> "$FINAL_OUTPUT"
+              fi
+            done
+          fi
+
+          echo "Final per-job output: $FINAL_OUTPUT"
+
+          if [ -n "$FINAL_REMAINING" ] && [ -f "$FINAL_REMAINING" ]; then
+            cp "$FINAL_REMAINING" "output/${{ matrix.domain }}_offset_${{ matrix.offset }}_remaining.csv"
+            echo "Final remaining file copied to output/${{ matrix.domain }}_offset_${{ matrix.offset }}_remaining.csv"
           fi
 
       - name: Upload chunk artifact

@@ -2,6 +2,8 @@ import os
 import sys
 import argparse
 import logging
+import csv
+import json
 
 # Configure logging similar to run_ashley.py
 logger = logging.getLogger("app")
@@ -28,6 +30,44 @@ from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 from fetcher.product_fetcher import ProductFetcher
 
+def load_urls_from_file(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"URLs file not found: {file_path}")
+
+    if file_path.lower().endswith(".json"):
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            urls = data.get("urls", [])
+        elif isinstance(data, list):
+            urls = data
+        else:
+            urls = []
+        return [str(u).strip() for u in urls if str(u).strip()]
+
+    if file_path.lower().endswith(".csv"):
+        urls = []
+        with open(file_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                url = (
+                    row.get("url")
+                    or row.get("Ref Product URL")
+                    or row.get("URL")
+                    or ""
+                ).strip()
+                if url:
+                    urls.append(url)
+        return urls
+
+    urls = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            url = line.strip()
+            if url:
+                urls.append(url)
+    return urls
+
 def main():
     parser = argparse.ArgumentParser(description='Run Coleman and Homegallerystores product scraper')
     
@@ -50,6 +90,8 @@ def main():
                        help='Output directory for CSV files')
     parser.add_argument('--verbose', action='store_true', default=False,
                        help='Enable verbose logging with progress updates')
+    parser.add_argument('--urls-file', default='',
+                       help='Optional file (csv/json/txt) with URLs for direct retry mode')
     
     args = parser.parse_args()
     
@@ -108,14 +150,35 @@ def main():
     logger.info(f"📁 Output will be saved to: {output_file}")
     logger.info(f"⚙️ Job parameters: offset={args.sitemap_offset}, max_sitemaps={args.max_sitemaps}, max_urls_per_sitemap={args.max_urls_per_sitemap}")
     logger.info(f"🔧 Concurrency: {max_workers} workers, delay={download_delay}s")
-    
-    process.crawl(ProductFetcher,
-                  website_url=args.website_url,
-                  sitemap_offset=args.sitemap_offset,
-                  max_sitemaps=args.max_sitemaps,
-                  max_urls_per_sitemap=args.max_urls_per_sitemap,
-                  job_id=args.job_id,
-                  verbose=args.verbose)
+
+    if args.urls_file:
+        input_urls = load_urls_from_file(args.urls_file)
+        if not input_urls:
+            logger.warning(f"No URLs found in urls-file: {args.urls_file}")
+            logger.info(f"✅ Scraping completed. Output saved to: {output_file}")
+            return output_file
+
+        logger.info(f"🔁 Retry mode enabled with {len(input_urls)} URLs from: {args.urls_file}")
+        process.crawl(
+            ProductFetcher,
+            website_url=args.website_url,
+            ashley_urls=input_urls,
+            is_ashley=True,
+            chunk_mode=False,
+            sitemap_offset=args.sitemap_offset,
+            max_sitemaps=args.max_sitemaps,
+            max_urls_per_sitemap=args.max_urls_per_sitemap,
+            job_id=args.job_id,
+            verbose=args.verbose
+        )
+    else:
+        process.crawl(ProductFetcher,
+                      website_url=args.website_url,
+                      sitemap_offset=args.sitemap_offset,
+                      max_sitemaps=args.max_sitemaps,
+                      max_urls_per_sitemap=args.max_urls_per_sitemap,
+                      job_id=args.job_id,
+                      verbose=args.verbose)
     process.start()
     logger.info(f"✅ Scraping completed. Output saved to: {output_file}")
     return output_file
