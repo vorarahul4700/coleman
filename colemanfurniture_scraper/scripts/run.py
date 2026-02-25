@@ -169,6 +169,7 @@ def main():
             max_sitemaps=args.max_sitemaps,
             max_urls_per_sitemap=args.max_urls_per_sitemap,
             job_id=args.job_id,
+            output_dir=args.output_dir,
             verbose=args.verbose
         )
     else:
@@ -178,6 +179,7 @@ def main():
                       max_sitemaps=args.max_sitemaps,
                       max_urls_per_sitemap=args.max_urls_per_sitemap,
                       job_id=args.job_id,
+                      output_dir=args.output_dir,
                       verbose=args.verbose)
     process.start()
     logger.info(f"✅ Scraping completed. Output saved to: {output_file}")

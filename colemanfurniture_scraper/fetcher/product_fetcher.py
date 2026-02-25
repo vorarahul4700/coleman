@@ -3,6 +3,7 @@ import xml.etree.ElementTree as ET
 import json
 import re
 import csv
+import sqlite3
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 from scrapy import Spider, Request
@@ -55,13 +56,19 @@ class ProductFetcher(Spider):
         self.max_sitemaps = int(kwargs.get('max_sitemaps', 0))
         self.max_urls_per_sitemap = int(kwargs.get('max_urls_per_sitemap', 0))
         self.job_id = kwargs.get('job_id', datetime.now().strftime('%Y%m%d_%H%M%S'))
+        self.output_dir = kwargs.get('output_dir', 'output')
         
         parsed_url = urlparse(self.website_url)
         self.domain = parsed_url.netloc
         self.base_domain = '.'.join(self.domain.split('.')[-2:]).replace('.', '_')
         
-        # SIMPLE DEDUPLICATION: Use a set to track URLs processed in this job
-        self.processed_in_this_job = set()
+        # URL state tracking:
+        # - queued_or_processing_urls: already scheduled and not yet finished
+        # - processed_successfully_urls: completed without request failure
+        self.queued_or_processing_urls = set()
+        self.processed_successfully_urls = set()
+        self.success_db_conn = None
+        self.success_db_write_counter = 0
         
         # PROGRESS TRACKING
         self.start_time = time.time()
@@ -70,11 +77,16 @@ class ProductFetcher(Spider):
         self.skipped_count = 0
         self.failed_count = 0
         self.failed_requests = {}
+        self.unscraped_requests = {}
         self.last_log_time = self.start_time
         self.log_interval = 30  # Log progress every 30 seconds
         self.sitemap_urls_count = {}  # Track URLs per sitemap
         
         self.logger.info(f"📁 Starting job {self.job_id} - chunk {self.chunk_id}")
+
+        # Persistent cross-job dedup store:
+        # once URL is scraped successfully, skip it in future jobs.
+        self._init_success_store()
         
         # Only process sitemaps if not in Ashley mode
         if not self.is_ashley:
@@ -115,10 +127,104 @@ class ProductFetcher(Spider):
         """Normalize URL for consistent deduplication"""
         if not url:
             return url
-        # Remove trailing slash and fragment
+        # Normalize scheme/netloc, remove trailing slash and fragment, sort query params
         parsed = urlparse(url)
-        normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+        path = parsed.path.rstrip('/')
+        query = parsed.query
+        if query:
+            query_parts = [p for p in query.split('&') if p]
+            query_parts.sort()
+            query = '&'.join(query_parts)
+        normalized = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+        if query:
+            normalized = f"{normalized}?{query}"
         return normalized
+
+    def _should_schedule_url(self, url: str) -> bool:
+        normalized_url = self.normalize_url(url)
+        if not normalized_url:
+            return False
+
+        # Skip if already completed successfully
+        if normalized_url in self.processed_successfully_urls:
+            self.skipped_count += 1
+            if self.verbose:
+                self.logger.info(f"⏭️ URL already scraped successfully: {normalized_url}")
+            return False
+
+        # Skip if already queued/in-progress
+        if normalized_url in self.queued_or_processing_urls:
+            self.skipped_count += 1
+            if self.verbose:
+                self.logger.info(f"⏭️ URL already queued/in-progress: {normalized_url}")
+            return False
+
+        self.queued_or_processing_urls.add(normalized_url)
+        return True
+
+    def _get_success_store_path(self):
+        override_path = os.getenv('SUCCESS_URL_DB_PATH', '').strip()
+        if override_path:
+            return override_path
+        os.makedirs(self.output_dir, exist_ok=True)
+        return os.path.join(self.output_dir, f"success_urls_{self.base_domain}.sqlite3")
+
+    def _init_success_store(self):
+        try:
+            success_store_path = self._get_success_store_path()
+            self.success_db_conn = sqlite3.connect(success_store_path, timeout=30)
+            cursor = self.success_db_conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS successful_urls (
+                    domain TEXT NOT NULL,
+                    normalized_url TEXT NOT NULL,
+                    first_success_at TEXT NOT NULL,
+                    job_id TEXT,
+                    PRIMARY KEY (domain, normalized_url)
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_successful_urls_domain
+                ON successful_urls(domain)
+            """)
+            self.success_db_conn.commit()
+
+            cursor.execute(
+                "SELECT normalized_url FROM successful_urls WHERE domain = ?",
+                (self.domain.lower(),)
+            )
+            rows = cursor.fetchall()
+            if rows:
+                self.processed_successfully_urls.update(row[0] for row in rows if row and row[0])
+            self.logger.info(
+                f"🗂️ Loaded {len(rows)} previously successful URLs for {self.domain} from {success_store_path}"
+            )
+        except Exception as e:
+            self.logger.error(f"❌ Failed to initialize persistent dedup store: {e}")
+            self.success_db_conn = None
+
+    def _persist_success_url(self, normalized_url: str):
+        if not self.success_db_conn or not normalized_url:
+            return
+        try:
+            self.success_db_conn.execute(
+                """
+                INSERT OR IGNORE INTO successful_urls (domain, normalized_url, first_success_at, job_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    self.domain.lower(),
+                    normalized_url,
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    self.job_id
+                )
+            )
+            self.success_db_write_counter += 1
+            if self.success_db_write_counter >= 50:
+                self.success_db_conn.commit()
+                self.success_db_write_counter = 0
+        except Exception as e:
+            self.logger.error(f"❌ Failed to persist successful URL {normalized_url}: {e}")
           
     def start_requests(self):
         if self.is_ashley:
@@ -148,17 +254,8 @@ class ProductFetcher(Spider):
             
             # Create requests for each URL with Scrapy's built-in dupefilter
             for i, url in enumerate(urls_to_process):
-                normalized_url = self.normalize_url(url)
-                
-                # Skip if already processed in this job
-                if normalized_url in self.processed_in_this_job:
-                    self.skipped_count += 1
-                    if self.verbose:
-                        self.logger.info(f"⏭️ URL already processed in this job: {normalized_url}")
+                if not self._should_schedule_url(url):
                     continue
-                
-                # Add to job tracking set
-                self.processed_in_this_job.add(normalized_url)
                 
                 # Add referer for subsequent requests
                 headers = self.get_headers()
@@ -224,18 +321,9 @@ class ProductFetcher(Spider):
                 plp_count += 1
                 continue
             pdp_count += 1
-            
-            normalized_url = self.normalize_url(url)
-            
-            # Check if URL already processed in this job
-            if normalized_url in self.processed_in_this_job:
-                self.skipped_count += 1
-                if self.verbose:
-                    self.logger.info(f"⏭️ URL already processed in this job: {normalized_url}")
+
+            if not self._should_schedule_url(url):
                 continue
-            
-            # Add to job tracking set
-            self.processed_in_this_job.add(normalized_url)
             
             yield Request(
                 url,
@@ -257,19 +345,10 @@ class ProductFetcher(Spider):
     def parse_product_page_with_check(self, response):
         # Update progress counters
         self.processed_count += 1
-        
-        # Simple deduplication check
-        normalized_url = self.normalize_url(response.url)
-        
-        # Check if we've already processed this URL in this job
-        if normalized_url in self.processed_in_this_job and normalized_url != response.url:
-            self.skipped_count += 1
-            if self.verbose:
-                self.logger.info(f"⏭️ [{self.processed_count}/{self.total_urls_found}] Skipping duplicate: {response.url}")
-            return
-        elif normalized_url not in self.processed_in_this_job:
-            # Add to tracking set if not already there
-            self.processed_in_this_job.add(normalized_url)
+
+        requested_url = response.meta.get('url', response.url)
+        requested_normalized = self.normalize_url(requested_url)
+        response_normalized = self.normalize_url(response.url)
         
         # Log progress periodically
         current_time = time.time()
@@ -321,12 +400,26 @@ class ProductFetcher(Spider):
         if has_product_json:
             if self.verbose:
                 self.logger.info(f"✅ Found Product JSON-LD for {response.url}")
+            # Mark URL as successfully scraped only when Product JSON-LD is present.
+            if requested_normalized in self.queued_or_processing_urls:
+                self.queued_or_processing_urls.discard(requested_normalized)
+            if requested_normalized:
+                self.processed_successfully_urls.add(requested_normalized)
+                self._persist_success_url(requested_normalized)
+            if response_normalized:
+                self.processed_successfully_urls.add(response_normalized)
+                self._persist_success_url(response_normalized)
             yield from self.parse_product_page(response)
             yield from self.extract_bundle_products(response)
         else:
+            if requested_normalized in self.queued_or_processing_urls:
+                self.queued_or_processing_urls.discard(requested_normalized)
+            if response_normalized in self.queued_or_processing_urls:
+                self.queued_or_processing_urls.discard(response_normalized)
+            self.failed_count += 1
             if self.verbose:
                 self.logger.warning(f"⚠️ No Product JSON-LD found for {response.url}")
-            yield from self.parse_product_page(response)
+            return
     
     def extract_bundle_products(self, response):
         json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
@@ -354,16 +447,10 @@ class ProductFetcher(Spider):
                         continue
                     
                     normalized_url = self.normalize_url(sub_product_url)
-                    
-                    # Check if sub-product URL is already processed in this job
-                    if normalized_url in self.processed_in_this_job:
-                        self.skipped_count += 1
+                    if not self._should_schedule_url(sub_product_url):
                         if self.verbose:
-                            self.logger.info(f"⏭️ Bundle product already processed: {item_short_name} - {normalized_url}")
+                            self.logger.info(f"⏭️ Bundle product already tracked: {item_short_name} - {normalized_url}")
                         continue
-                    
-                    # Add to job tracking set before yielding
-                    self.processed_in_this_job.add(normalized_url)
                     bundle_count += 1
                     
                     if self.verbose:
@@ -1028,6 +1115,48 @@ class ProductFetcher(Spider):
             fallback_dir,
             f"remaining_{self.base_domain}_{self.job_id}.csv"
         )
+
+    def _get_unscraped_file_path(self):
+        feed_uri = ""
+        if hasattr(self, "crawler") and getattr(self, "crawler", None):
+            feed_uri = self.crawler.settings.get("FEED_URI", "") or ""
+
+        if feed_uri:
+            feed_dir = os.path.dirname(feed_uri) or "."
+            feed_name = os.path.basename(feed_uri)
+            feed_stem, _ = os.path.splitext(feed_name)
+            if feed_stem.startswith("output_"):
+                unscraped_name = feed_stem.replace("output_", "unscraped_", 1) + ".csv"
+            else:
+                unscraped_name = f"{feed_stem}_unscraped.csv"
+            return os.path.join(feed_dir, unscraped_name)
+
+        fallback_dir = "output"
+        os.makedirs(fallback_dir, exist_ok=True)
+        return os.path.join(
+            fallback_dir,
+            f"unscraped_{self.base_domain}_{self.job_id}.csv"
+        )
+
+    def _record_unscraped(
+        self,
+        url: str,
+        reason: str,
+        status: str = "N/A",
+        error_type: str = "",
+        error_message: str = ""
+    ):
+        if not url:
+            return
+        key = self.normalize_url(url) or url
+        self.unscraped_requests[key] = {
+            "url": url,
+            "reason": reason,
+            "status": str(status),
+            "error_type": error_type,
+            "error_message": error_message,
+            "failed_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
     
     def handle_product_error(self, failure):
         self.failed_count += 1
@@ -1040,11 +1169,19 @@ class ProductFetcher(Spider):
         
         # Try to extract URL and status code from the failure
         if hasattr(failure, 'request') and failure.request:
-            failed_url = failure.request.url
+            request_url = failure.request.url
+            failed_url = request_url
             
             # Check meta for original URL if available
             if hasattr(failure.request, 'meta') and 'url' in failure.request.meta:
                 failed_url = failure.request.meta['url']
+            # Unlock failed URL(s) so they can be retried if seen again
+            failed_normalized = self.normalize_url(failed_url)
+            request_normalized = self.normalize_url(request_url)
+            if failed_normalized:
+                self.queued_or_processing_urls.discard(failed_normalized)
+            if request_normalized:
+                self.queued_or_processing_urls.discard(request_normalized)
         
         # Extract status code from response if available
         if hasattr(failure, 'value') and hasattr(failure.value, 'response') and failure.value.response:
@@ -1070,6 +1207,16 @@ class ProductFetcher(Spider):
             "error_message": error_msg,
             "failed_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
+
+        # Final "unscraped" CSV includes only 404 and 301.
+        if str(status_code) in {"404", "301"}:
+            self._record_unscraped(
+                failed_url,
+                reason="REQUEST_FAILED",
+                status=str(status_code),
+                error_type=error_type,
+                error_message=error_msg
+            )
                
         # Log the detailed error with status code prominently displayed
         self.logger.error("=" * 70)
@@ -1133,6 +1280,37 @@ class ProductFetcher(Spider):
                         "job_id": self.job_id,
                         "chunk_id": self.chunk_id,
                     })
+
+        unscraped_file = None
+        if self.unscraped_requests:
+            unscraped_file = self._get_unscraped_file_path()
+            os.makedirs(os.path.dirname(unscraped_file) or ".", exist_ok=True)
+            with open(unscraped_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "url",
+                        "reason",
+                        "status",
+                        "error_type",
+                        "error_message",
+                        "failed_at",
+                        "job_id",
+                        "chunk_id",
+                    ]
+                )
+                writer.writeheader()
+                for row in self.unscraped_requests.values():
+                    writer.writerow({
+                        "url": row.get("url", ""),
+                        "reason": row.get("reason", ""),
+                        "status": row.get("status", ""),
+                        "error_type": row.get("error_type", ""),
+                        "error_message": row.get("error_message", ""),
+                        "failed_at": row.get("failed_at", ""),
+                        "job_id": self.job_id,
+                        "chunk_id": self.chunk_id,
+                    })
         
         self.logger.info("=" * 70)
         self.logger.info(f"🏁 FINAL SCRAPING REPORT - Job: {self.job_id}")
@@ -1145,6 +1323,9 @@ class ProductFetcher(Spider):
         if remaining_file:
             self.logger.info(f"      - 🔁 Remaining file: {remaining_file}")
             print(f"REMAINING_FILE={remaining_file}")
+        if unscraped_file:
+            self.logger.info(f"      - 📄 Unscraped file (only 404/301): {unscraped_file}")
+            print(f"UNSCRAPED_FILE={unscraped_file}")
         self.logger.info(f"   📈 Performance:")
         self.logger.info(f"      - Success rate: {success_rate:.1f}%")
         self.logger.info(f"      - Total time: {self.format_time(elapsed)}")
@@ -1154,3 +1335,10 @@ class ProductFetcher(Spider):
             self.logger.info(f"   📚 Sitemaps processed: {len(self.sitemap_urls_count)}")
         
         self.logger.info("=" * 70)
+
+        if self.success_db_conn:
+            try:
+                self.success_db_conn.commit()
+                self.success_db_conn.close()
+            except Exception as e:
+                self.logger.error(f"❌ Error closing persistent dedup store: {e}")

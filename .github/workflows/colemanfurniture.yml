@@ -276,9 +276,12 @@ jobs:
           OUTPUT_CSV=$(ls output/output_${DOMAIN}_${JOB_ID}_${TIMESTAMP}.csv 2>/dev/null || echo "")
           REMAINING_CSV=$(ls output/remaining_${DOMAIN}_${JOB_ID}_${TIMESTAMP}.csv 2>/dev/null || \
                           ls output/remaining_${DOMAIN}_${JOB_ID}.csv 2>/dev/null || echo "")
+          UNSCRAPED_CSV=$(ls output/unscraped_${DOMAIN}_${JOB_ID}_${TIMESTAMP}.csv 2>/dev/null || \
+                          ls output/unscraped_${DOMAIN}_${JOB_ID}.csv 2>/dev/null || echo "")
 
           echo "Output CSV  : ${OUTPUT_CSV:-<none>}"
           echo "Remaining CSV: ${REMAINING_CSV:-<none>}"
+          echo "Unscraped CSV: ${UNSCRAPED_CSV:-<none>}"
 
           # Normalise names for upload
           if [ -n "$OUTPUT_CSV" ] && [ -f "$OUTPUT_CSV" ]; then
@@ -299,6 +302,15 @@ jobs:
               > "output/remaining_job${JOB_IDX}_r${ROUND}.csv"
           fi
 
+          if [ -n "$UNSCRAPED_CSV" ] && [ -f "$UNSCRAPED_CSV" ] && [ "$(wc -l < "$UNSCRAPED_CSV")" -gt 1 ]; then
+            cp "$UNSCRAPED_CSV" "output/unscraped_job${JOB_IDX}_r${ROUND}.csv"
+            UNS_COUNT=$(tail -n +2 "output/unscraped_job${JOB_IDX}_r${ROUND}.csv" | grep -v '^$' | wc -l)
+            echo "Unscraped URLs in this job: $UNS_COUNT"
+          else
+            echo "url,reason,status,error_type,error_message,failed_at,job_id,chunk_id" \
+              > "output/unscraped_job${JOB_IDX}_r${ROUND}.csv"
+          fi
+
       # ── Upload per-job scraped output ──────────────────────────────────────
       - name: Upload scraped output artifact
         uses: actions/upload-artifact@v4
@@ -313,6 +325,14 @@ jobs:
         with:
           name: remaining_job${{ matrix.job_index }}_r${{ env.CURRENT_ROUND }}
           path: output/remaining_job${{ matrix.job_index }}_r${{ env.CURRENT_ROUND }}.csv
+          retention-days: 3
+
+      # ── Upload per-job unscraped URLs ─────────────────────────────────────
+      - name: Upload unscraped URLs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unscraped_job${{ matrix.job_index }}_r${{ env.CURRENT_ROUND }}
+          path: output/unscraped_job${{ matrix.job_index }}_r${{ env.CURRENT_ROUND }}.csv
           retention-days: 3
 
   # ── MERGE ─────────────────────────────────────────────────────────────────
@@ -340,6 +360,14 @@ jobs:
         with:
           pattern: remaining_job*_r${{ env.CURRENT_ROUND }}
           path: chunks/remaining
+          merge-multiple: true
+
+      # ── Download all per-job unscraped artifacts ──────────────────────────
+      - name: Download unscraped artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unscraped_job*_r${{ env.CURRENT_ROUND }}
+          path: chunks/unscraped
           merge-multiple: true
 
       # ── Merge scraped output CSVs into final product file ──────────────────
@@ -396,6 +424,29 @@ jobs:
           fi
           echo "remaining_count=$TOTAL_REMAINING" >> $GITHUB_OUTPUT
 
+      # ── Merge unscraped-URL CSVs into one file ────────────────────────────
+      - name: Merge unscraped URLs
+        run: |
+          echo "=== Merging unscraped URL CSVs ==="
+          UNS_FILES=$(find chunks/unscraped -name "*.csv" -type f 2>/dev/null || true)
+          TOTAL_UNSCRAPED=0
+
+          if [ -z "$UNS_FILES" ]; then
+            echo "No unscraped CSV files found."
+            echo "url,reason,status,error_type,error_message,failed_at,job_id,chunk_id" > unscraped_merged.csv
+          else
+            FIRST=$(echo "$UNS_FILES" | head -n 1)
+            head -n 1 "$FIRST" > unscraped_merged.csv
+            for f in $UNS_FILES; do
+              if [ -s "$f" ] && [ "$(wc -l < "$f")" -gt 1 ]; then
+                ROWS=$(tail -n +2 "$f" | grep -v '^$' | wc -l)
+                TOTAL_UNSCRAPED=$((TOTAL_UNSCRAPED + ROWS))
+                tail -n +2 "$f" | grep -v '^$' >> unscraped_merged.csv
+              fi
+            done
+            echo "Merged $TOTAL_UNSCRAPED unscraped URLs from $(echo "$UNS_FILES" | wc -l) files"
+          fi
+
       # ── Build output filename ──────────────────────────────────────────────
       - name: Build output filename
         id: meta
@@ -423,6 +474,14 @@ jobs:
           name: remaining_merged
           path: remaining_merged.csv
           retention-days: 2
+
+      # ── Upload merged unscraped CSV ───────────────────────────────────────
+      - name: Upload merged unscraped CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: unscraped_merged
+          path: unscraped_merged.csv
+          retention-days: 7
 
       # ── FTP upload ─────────────────────────────────────────────────────────
       - name: Upload to FTP server
@@ -468,7 +527,7 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -rf chunks products_full.csv remaining_merged.csv
+        run: rm -rf chunks products_full.csv remaining_merged.csv unscraped_merged.csv
 
   # ── RE-TRIGGER (next round) ───────────────────────────────────────────────
   trigger_next_round:
