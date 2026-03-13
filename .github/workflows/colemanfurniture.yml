@@ -111,11 +111,18 @@ jobs:
               exit 0
             fi
 
-            # Split into chunks of PER_JOB urls (reusing sitemaps_per_job as chunk size)
+            # Split into chunks — never exceed GitHub's 256-job matrix limit
+            MAX_JOBS=200
             CHUNK_SIZE=$(( PER_JOB * 500 ))   # keep same scale as initial run
             [ "$CHUNK_SIZE" -lt 1 ] && CHUNK_SIZE=500
             JOBS=$(( (TOTAL_URLS + CHUNK_SIZE - 1) / CHUNK_SIZE ))
             [ $JOBS -eq 0 ] && JOBS=1
+            # If we'd exceed the limit, recalculate chunk size to fit within 256 jobs
+            if [ "$JOBS" -gt "$MAX_JOBS" ]; then
+              CHUNK_SIZE=$(( (TOTAL_URLS + MAX_JOBS - 1) / MAX_JOBS ))
+              JOBS=$MAX_JOBS
+              echo "⚠ Adjusted chunk size to $CHUNK_SIZE to stay within $MAX_JOBS job limit"
+            fi
 
             # Write individual chunk files
             mkdir -p remaining_chunks
